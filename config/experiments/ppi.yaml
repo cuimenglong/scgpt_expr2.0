@@ -1,0 +1,31 @@
+# PPI experiment configuration
+# Uses HVG genes + ESM embeddings + OmniPath PPI network
+
+experiment_type: "ppi"
+model: "ppi"
+
+# Data paths
+data_path: "/home/dataset-assist-0/cuimenglong/workspace/data/tahoe/experiment/processed/train.h5ad"
+test_data_path: "/home/dataset-assist-0/cuimenglong/workspace/data/tahoe/experiment/processed/test.h5ad"
+drug_meta_path: "/home/dataset-assist-0/cuimenglong/workspace/data/tahoe/drug_metadata.parquet"
+vocab_path: "./scgpt/tokenizer/default_gene_vocab.json"
+pretrained_path: "/home/dataset-assist-0/cuimenglong/workspace/data/scgpt/best_model.pt"
+
+# ESM embeddings
+esm_path: "./protein_esm_embeddings.pt"
+
+# PPI settings
+use_ppi: true
+ppi_tsv_path: null  # Path to local PPI TSV file (if null, will download from OmniPath)
+ppi_cache_dir: "./data"
+
+# Model settings
+d_model: 512
+n_hvg: 2000
+scgpt_layers: 12
+gp_layers: 3
+
+# Training settings
+batch_size: 64
+lr: 0.0001
+epochs: 30

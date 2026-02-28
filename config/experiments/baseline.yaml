@@ -1,0 +1,22 @@
+# Baseline experiment configuration
+# Uses only HVG genes without protein embeddings or PPI
+
+experiment_type: "baseline"
+model: "baseline"
+
+# Data paths
+data_path: "/home/dataset-assist-0/cuimenglong/workspace/data/tahoe/experiment/processed/train.h5ad"
+test_data_path: "/home/dataset-assist-0/cuimenglong/workspace/data/tahoe/experiment/processed/test.h5ad"
+drug_meta_path: "/home/dataset-assist-0/cuimenglong/workspace/data/tahoe/drug_metadata.parquet"
+vocab_path: "./scgpt/tokenizer/default_gene_vocab.json"
+pretrained_path: "/home/dataset-assist-0/cuimenglong/workspace/data/scgpt/best_model.pt"
+
+# Model settings
+d_model: 512
+n_hvg: 2000
+nlayers: 6
+
+# Training settings
+batch_size: 64
+lr: 0.0001
+epochs: 30
