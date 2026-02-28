@@ -13,21 +13,62 @@ Usage:
 
 import os
 import sys
+
+# Set environment variables BEFORE importing torch
+os.environ["HF_SKIP_CHECK_TORCH_LOAD_SAFE"] = "True"
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
+# Apply torchtext patch BEFORE importing torch
+from types import ModuleType
+try:
+    import torch
+    
+    # 1. Mock torchtext._extension to prevent loading .so library
+    mock_extension = ModuleType("torchtext._extension")
+    mock_extension._init_extension = lambda: None
+    sys.modules["torchtext._extension"] = mock_extension
+    
+    # 2. Intercept torch.ops.load_library
+    orig_load_library = torch.ops.load_library
+    def mocked_load(path):
+        if "libtorchtext" in path:
+            return
+        return orig_load_library(path)
+    torch.ops.load_library = mocked_load
+    
+    # 3. Construct mock Vocab class and module
+    class MockVocab:
+        def __init__(self, vocab):
+            self.vocab = vocab
+            self.itos = list(vocab.keys()) if isinstance(vocab, dict) else []
+        def __len__(self): 
+            return len(self.itos)
+    
+    # Create mock torchtext.vocab module
+    mt_vocab = ModuleType("torchtext.vocab")
+    mt_vocab.Vocab = MockVocab
+    sys.modules["torchtext.vocab"] = mt_vocab
+    
+    # Create mock torchtext top-level module
+    mt_root = ModuleType("torchtext")
+    mt_root.vocab = mt_vocab
+    sys.modules["torchtext"] = mt_root
+    
+    print("--- torchtext patch applied successfully ---")
+    
+except Exception as e:
+    print(f"--- torchtext patch failed: {e} ---")
+
 import argparse
 import json
 import random
 import numpy as np
-import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # Add project root to path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
-
-# Apply torchtext patch
-from src.utils.torchtext_patch import patch_torchtext
-patch_torchtext()
 
 import scanpy as sc
 import pandas as pd
