@@ -2,7 +2,11 @@
 Unified Inference Script for scGPT Perturbation Experiments
 
 Usage:
+    # Inference only
     python scripts/infer.py --checkpoint checkpoints1/model.pt --output infer/result.h5ad
+    
+    # Inference with evaluation
+    python scripts/infer.py --checkpoint checkpoints1/model.pt --output infer/result.h5ad --evaluate
 """
 
 import os
@@ -25,7 +29,13 @@ import pandas as pd
 import anndata as ad
 
 # Import src modules
-from src.models import scGPTBaseline, scGPTWithVirtualProtein, scGPTWithVirtualProteinAndPPI
+from src.models import (
+    scGPTBaseline, 
+    scGPTWithVirtualProtein, 
+    scGPTWithVirtualProteinAndPPI,
+    scGPTWithTargetBias,
+    scGPTWithMetadata
+)
 
 
 def get_model_class(model_name: str):
@@ -34,6 +44,8 @@ def get_model_class(model_name: str):
         'baseline': scGPTBaseline,
         'protein': scGPTWithVirtualProtein,
         'ppi': scGPTWithVirtualProteinAndPPI,
+        'target_bias': scGPTWithTargetBias,
+        'metaselection': scGPTWithMetadata,
     }
     
     model_name_lower = model_name.lower()
@@ -77,6 +89,22 @@ def prepare_inference_data(test_h5ad_path: str, drug_meta_path: str, selected_ge
         core_X[:, i] = val
     
     return adata_full, core_X, train_gene_list, drug_meta, core_gene_idx_in_full
+
+
+def run_evaluation(infer_path: str, test_path: str, core_genes_path: str, output_dir: str):
+    """Run evaluation after inference"""
+    from evaluate import evaluate_model
+    
+    print("\n" + "="*60)
+    print("Running Evaluation...")
+    print("="*60)
+    
+    evaluate_model(
+        infer_path=infer_path,
+        test_path=test_path,
+        core_genes_path=core_genes_path,
+        output_dir=output_dir
+    )
 
 
 def run_inference(args):
@@ -138,6 +166,20 @@ def run_inference(args):
     if args.model == 'ppi':
         model_kwargs['ppi_adjacency'] = ppi_adjacency
     
+    # Add target_bias params
+    if args.model == 'target_bias':
+        # Load gene_ids for target_bias model
+        gene_ids_tensor = torch.tensor(
+            [vocab_dict.get(g, vocab_dict.get("<unk>", 0)) for g in train_gene_list],
+            dtype=torch.long
+        )
+        model_kwargs['gene_ids'] = gene_ids_tensor
+        model_kwargs['target_bias_value'] = args.target_bias_value
+    
+    # Add metadata_dim for metaselection
+    if args.model == 'metaselection':
+        model_kwargs['metadata_dim'] = 4
+    
     model = ModelClass(**model_kwargs).to(device)
     
     # Load weights
@@ -152,6 +194,20 @@ def run_inference(args):
     cell_lines = []
     drugs = []
     
+    # Build drug to target mapping for target_bias model
+    drug_to_target_gene_ids = {}
+    if args.model == 'target_bias' and args.drug_meta:
+        for _, row in drug_meta.iterrows():
+            drug = row['drug']
+            targets = str(row['targets']).split(',') if pd.notna(row.get('targets', '')) else []
+            t_ids = []
+            for t in targets:
+                t_upper = t.upper().strip()
+                if t_upper in vocab_dict:
+                    t_ids.append(vocab_dict[t_upper])
+            if len(t_ids) > 0:
+                drug_to_target_gene_ids[drug] = t_ids
+    
     # Simplified inference loop
     with torch.no_grad():
         for i in range(adata_full.n_obs):
@@ -162,7 +218,8 @@ def run_inference(args):
             cell_line = adata_full.obs.iloc[i]['cell_line']
             cell_type_id = hash(cell_line) % n_celltype
             
-            # Get drug embedding (simplified)
+            # Get drug embedding (for now use zeros or random - should load precomputed)
+            drug_name = adata_full.obs.iloc[i]['drug']
             drug_emb = torch.randn(1, 384).to(device)
             
             # Forward
@@ -171,16 +228,30 @@ def run_inference(args):
                 dtype=torch.long
             ).to(device)
             
-            pred = model(
-                gene_ids.unsqueeze(0),
-                expr.unsqueeze(0),
-                drug_emb,
-                torch.tensor([cell_type_id], device=device)
-            )
+            if args.model == 'target_bias':
+                target_gene_ids = drug_to_target_gene_ids.get(drug_name, [])
+                if target_gene_ids:
+                    target_tensor = torch.tensor([target_gene_ids], dtype=torch.long).to(device)
+                else:
+                    target_tensor = torch.tensor([[-1]], dtype=torch.long).to(device)
+                
+                pred = model(
+                    c_gene=expr.unsqueeze(0),
+                    drug_emb=drug_emb,
+                    cell_type_id=torch.tensor([cell_type_id], device=device),
+                    target_gene_ids=target_tensor
+                )
+            else:
+                pred = model(
+                    gene_ids.unsqueeze(0),
+                    expr.unsqueeze(0),
+                    drug_emb,
+                    torch.tensor([cell_type_id], device=device)
+                )
             
             predictions.append(pred.cpu().numpy())
             cell_lines.append(cell_line)
-            drugs.append(adata_full.obs.iloc[i]['drug'])
+            drugs.append(drug_name)
     
     predictions = np.array(predictions)
     
@@ -198,6 +269,18 @@ def run_inference(args):
     os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
     result_adata.write_h5ad(args.output)
     print(f"Inference complete! Results saved to: {args.output}")
+    
+    # Run evaluation if requested
+    if args.evaluate:
+        # Extract checkpoint name for output directory
+        checkpoint_name = os.path.basename(args.checkpoint).replace('.pt', '')
+        eval_output_dir = f"./evaluation/{checkpoint_name}"
+        run_evaluation(
+            infer_path=args.output,
+            test_path=args.test_data,
+            core_genes_path=selected_genes_path,
+            output_dir=eval_output_dir
+        )
     
     return args.output
 
@@ -222,14 +305,20 @@ def main():
                        default='./scgpt/tokenizer/default_gene_vocab.json',
                        help='Path to vocab file')
     parser.add_argument('--model', type=str, default='baseline',
-                       choices=['baseline', 'protein', 'ppi'],
+                       choices=['baseline', 'protein', 'ppi', 'target_bias', 'metaselection'],
                        help='Model type')
     parser.add_argument('--d-model', type=int, default=512,
                        help='Model dimension')
+    parser.add_argument('--target-bias-value', type=float, default=5.0,
+                       help='Target bias value for target_bias model')
     parser.add_argument('--n-controls', type=int, default=5,
                        help='Number of control samples')
     parser.add_argument('--device', type=str, default='cuda',
                        help='Device to use')
+    
+    # Evaluation options
+    parser.add_argument('--evaluate', '-e', action='store_true',
+                       help='Run evaluation after inference')
     
     args = parser.parse_args()
     
