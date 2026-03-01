@@ -197,7 +197,7 @@ def run_inference(args):
         'd_model': args.d_model,
         'nhead': 8,
         'd_hid': args.d_model,
-        'nlayers': 6 if args.model == 'baseline' else 12,
+        'nlayers': 12,
         'scgpt_layers': 12,
         'gp_layers': 3,
         'n_celltype': n_celltype,

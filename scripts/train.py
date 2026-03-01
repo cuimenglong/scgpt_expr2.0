@@ -400,7 +400,7 @@ def train(args):
         'd_model': d_model,
         'nhead': 8,
         'd_hid': d_model,
-        'nlayers': 6 if model_name == 'baseline' else 12,
+        'nlayers': 12,
         'scgpt_layers': 12,
         'gp_layers': 3,
         'n_celltype': n_celltype,

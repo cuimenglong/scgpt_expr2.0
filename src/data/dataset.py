@@ -48,7 +48,7 @@ class H5ADPerturbationDataset(Dataset):
             self.adata.obs['cell_line_idx'] = self.adata.obs['cell_line'].astype('category').cat.codes
             
         # Extract perturbation indices
-        self.perturb_indices = np.where(self.adata.obs['drug'] != control_drug)[0]
+        self.perturb_indices = np.where(self.adata.obs['drug'] != control_drug_name)[0]
         self.control_drug_name = control_drug_name
         self.drug_to_target_nodes = drug_to_target_nodes
         self.device = device
@@ -61,7 +61,7 @@ class H5ADPerturbationDataset(Dataset):
             # KNN-based control matching (for metaselection experiment)
             print("Building KNN indices for metadata matching...")
             for cl in all_obs['cell_line'].unique():
-                ctrl_mask = (all_obs['cell_line'] == cl) & (all_obs['drug'] == control_drug)
+                ctrl_mask = (all_obs['cell_line'] == cl) & (all_obs['drug'] == control_drug_name)
                 ctrl_indices = np.where(ctrl_mask)[0]
                 
                 if len(ctrl_indices) > 0:
@@ -75,7 +75,7 @@ class H5ADPerturbationDataset(Dataset):
         else:
             # Simple control matching by cell line (random)
             for cl in all_obs['cell_line'].unique():
-                indices = np.where((all_obs['cell_line'] == cl) & (all_obs['drug'] == control_drug))[0]
+                indices = np.where((all_obs['cell_line'] == cl) & (all_obs['drug'] == control_drug_name))[0]
                 if len(indices) > 0:
                     self.control_pool[cl] = indices
         
@@ -231,7 +231,7 @@ class SimplePerturbationDataset(Dataset):
             self.adata.obs['cell_line_idx'] = self.adata.obs['cell_line'].astype('category').cat.codes
             
         # Extract perturbation indices
-        self.perturb_indices = np.where(self.adata.obs['drug'] != control_drug)[0]
+        self.perturb_indices = np.where(self.adata.obs['drug'] != control_drug_name)[0]
         self.control_drug_name = control_drug_name
         self.device = device
         
@@ -239,7 +239,7 @@ class SimplePerturbationDataset(Dataset):
         self.control_pool = {}
         all_obs = self.adata.obs
         for cl in all_obs['cell_line'].unique():
-            indices = np.where((all_obs['cell_line'] == cl) & (all_obs['drug'] == control_drug))[0]
+            indices = np.where((all_obs['cell_line'] == cl) & (all_obs['drug'] == control_drug_name))[0]
             if len(indices) > 0:
                 self.control_pool[cl] = indices
 

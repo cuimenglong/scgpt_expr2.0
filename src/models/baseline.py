@@ -18,7 +18,7 @@ class scGPTBaseline(nn.Module):
         d_model: int = 512,
         nhead: int = 8,
         d_hid: int = 512,
-        nlayers: int = 6,
+        nlayers: int = 12,
         dropout: float = 0.1,
         drug_emb_dim: int = 384,
         n_celltype: int = 5

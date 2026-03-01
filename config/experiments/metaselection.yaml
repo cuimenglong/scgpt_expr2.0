@@ -17,7 +17,7 @@ metadata_dim: 4  # dosage, time, cell_line_type, etc.
 # Model settings
 d_model: 512
 n_hvg: 2000
-nlayers: 6
+nlayers: 12
 
 # Training settings
 batch_size: 64
