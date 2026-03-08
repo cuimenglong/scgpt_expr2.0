@@ -24,7 +24,7 @@ class scGPTWithVirtualProteinAndPPI(nn.Module):
         dropout: float = 0.1,
         n_celltype: int = 5,
         esm_dim: int = 1280,
-        drug_emb_dim: int = 384,
+        drug_emb_dim: int = 768,  # ChemBERTa-77M-MLM output dimension
         pos_bias: float = 2.0,
         neg_bias: float = -5.0,
         ppi_adjacency: np.ndarray = None  # PPI adjacency matrix
@@ -84,6 +84,7 @@ class scGPTWithVirtualProteinAndPPI(nn.Module):
         Sequence structure: [Drug] (1) + [Genes] (n_genes) + [Proteins] (n_prot)
         
         Now supports PPI prior: add bidirectional positive bias between protein nodes with PPI edges
+        Optimized with vectorized operations instead of nested loops
         """
         n_prot = len(prot_indices)
         total_len = 1 + n_genes + n_prot
@@ -105,20 +106,25 @@ class scGPTWithVirtualProteinAndPPI(nn.Module):
             # Prot -> Gene
             bias[actual_prot_idx, actual_gene_idx] = self.pos_bias
         
-        # 3. If PPI adjacency matrix exists, add bidirectional edges between protein nodes
+        # 3. Vectorized PPI edge handling - much faster than nested loops
         if self.ppi_adjacency is not None and n_prot > 0:
-            for i, gene_idx_i in enumerate(prot_indices):
-                for j, gene_idx_j in enumerate(prot_indices):
-                    if i == j:
-                        continue  # Skip self-loop
-                    # Check if there's an edge in the original PPI matrix
-                    if gene_idx_i < self.ppi_adjacency.shape[0] and gene_idx_j < self.ppi_adjacency.shape[1]:
-                        if self.ppi_adjacency[gene_idx_i, gene_idx_j] > 0:
-                            # PPI exists between protein nodes i and j, add bidirectional positive bias
-                            actual_prot_i = prot_start + i
-                            actual_prot_j = prot_start + j
-                            bias[actual_prot_i, actual_prot_j] = self.pos_bias
-                            bias[actual_prot_j, actual_prot_i] = self.pos_bias
+            # ppi_adjacency is registered as a buffer (Tensor), convert to numpy for indexing
+            ppi_np = self.ppi_adjacency.cpu().numpy()
+            
+            # Get the PPI sub-matrix for valid protein indices
+            # prot_indices contains the original gene indices, use them to index ppi_adjacency
+            ppi_submatrix = ppi_np[np.ix_(prot_indices, prot_indices)]
+            
+            # Find all edges (where value > 0)
+            edge_rows, edge_cols = np.where(ppi_submatrix > 0)
+            
+            # Map to actual positions in the bias matrix
+            actual_prot_i = prot_start + edge_rows
+            actual_prot_j = prot_start + edge_cols
+            
+            # Set bidirectional positive bias for PPI edges
+            bias[actual_prot_i, actual_prot_j] = self.pos_bias
+            bias[actual_prot_j, actual_prot_i] = self.pos_bias
         
         # Drug Token (Index 0) default bias is 0 with all nodes (Full Attention)
         return bias

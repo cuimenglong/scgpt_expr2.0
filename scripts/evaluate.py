@@ -77,10 +77,19 @@ def evaluate_model(
     
     # 1. Gene alignment
     print("Aligning genes...")
-    if not all(adata_infer.var_names == adata_test.var_names):
+    # Check if gene names match (need same length first)
+    if len(adata_infer.var_names) == len(adata_test.var_names) and all(adata_infer.var_names == adata_test.var_names):
+        print("  Gene names match perfectly, no alignment needed")
+    else:
         # Find common genes
         common_genes = adata_infer.var_names[np.isin(adata_infer.var_names, adata_test.var_names)]
-        print(f"Common genes: {len(common_genes)}")
+        print(f"  Inference genes: {len(adata_infer.var_names)}")
+        print(f"  Test genes: {len(adata_test.var_names)}")
+        print(f"  Common genes: {len(common_genes)}")
+        
+        if len(common_genes) == 0:
+            raise ValueError("No common genes found between inference and test data!")
+        
         adata_infer = adata_infer[:, common_genes].copy()
         adata_test = adata_test[:, common_genes].copy()
     
@@ -122,8 +131,27 @@ def evaluate_model(
                 X = X.toarray()
             return np.mean(X, axis=0).ravel()
         
-        # Get control (DMSO) expression
+        # Get control (DMSO) expression from test data
         ctrl_test_mean = get_mean(test_cl, control_drug)
+        
+        # If no DMSO in test data, try to get it from inference results
+        if ctrl_test_mean is None:
+            ctrl_infer_mean = get_mean(infer_cl, control_drug)
+            if ctrl_infer_mean is not None:
+                print(f"  Using predicted DMSO for cell line {cl}")
+                ctrl_test_mean = ctrl_infer_mean
+            else:
+                # Last resort: use mean of all predictions for this cell line as control
+                all_pred = infer_cl.X
+                if hasattr(all_pred, 'toarray'):
+                    all_pred = all_pred.toarray()
+                if all_pred.shape[0] > 0:
+                    ctrl_test_mean = np.mean(all_pred, axis=0).ravel()
+                    print(f"  Using mean expression as control for cell line {cl}")
+                else:
+                    print(f"Warning: No predictions for cell line {cl}")
+                    continue
+        
         if ctrl_test_mean is None:
             print(f"Warning: No control data for cell line {cl}")
             continue

@@ -38,7 +38,7 @@ class scGPTWithVirtualProtein(nn.Module):
         dropout: float = 0.1,
         n_celltype: int = 5,
         esm_dim: int = 1280,
-        drug_emb_dim: int = 384,
+        drug_emb_dim: int = 768,  # ChemBERTa-77M-MLM output dimension
         pos_bias: float = 2.0,
         neg_bias: float = -5.0
     ):

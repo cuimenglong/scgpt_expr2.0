@@ -29,9 +29,34 @@ class H5ADPerturbationDataset(Dataset):
         control_drug_name: str = "DMSO_TF",
         device: str = "cuda",
         compute_drug_embeddings: bool = False,
+        precomputed_drug_embeddings: Optional[Dict[str, torch.Tensor]] = None,  # NEW: Use precomputed embeddings
         use_knn_matching: bool = False,    # NEW: Use KNN for control matching
-        metadata_cols: Optional[List[str]] = None  # NEW: Metadata columns for KNN
+        metadata_cols: Optional[List[str]] = None,  # NEW: Metadata columns for KNN
+        apply_log1p: bool = True,  # NEW: Apply log1p transformation
+        apply_normalize: bool = False  # NEW: Apply normalize transformation
     ):
+        # ========== Apply log1p transformation if needed ==========
+        if apply_log1p:
+            # Check if data is already log1p transformed
+            # by checking if uns has 'log1p' key or if max value is too large
+            X_max = adata.X.max() if hasattr(adata.X, 'max') else adata.X.toarray().max()
+            needs_log1p = X_max > 30  # Raw counts typically have max > 30
+            
+            if needs_log1p:
+                print(f"Applying log1p transformation (max value: {X_max:.2f})...")
+                sc.pp.log1p(adata)
+            else:
+                print(f"Data appears to be already log1p transformed (max: {X_max:.2f}), skipping log1p")
+        
+        # ========== Apply normalize if requested ==========
+        if apply_normalize:
+            print("Applying normalize transformation...")
+            # Normalize each cell to have sum = 1e4 (like scanpy's normalize_total)
+            sc.pp.normalize_total(adata, target_sum=1e4)
+            # Then log1p if not already done
+            if X_max <= 30:
+                sc.pp.log1p(adata)
+        
         # Gene filtering
         if 'selected' in adata.var.columns:
             mask = adata.var['selected'] == True
@@ -81,7 +106,11 @@ class H5ADPerturbationDataset(Dataset):
         
         # Precompute ChemBERTa embeddings if requested
         self.drug_embeddings = {}
-        if compute_drug_embeddings:
+        if precomputed_drug_embeddings is not None:
+            # Use precomputed embeddings (from checkpoint)
+            print(f"Using {len(precomputed_drug_embeddings)} precomputed drug embeddings")
+            self.drug_embeddings = precomputed_drug_embeddings
+        elif compute_drug_embeddings:
             self.drug_embeddings = self._precompute_drug_embeddings()
 
     def _precompute_drug_embeddings(self, embedding_dim: int = 768) -> Dict[str, torch.Tensor]:
@@ -110,6 +139,13 @@ class H5ADPerturbationDataset(Dataset):
         tokenizer = AutoTokenizer.from_pretrained("DeepChem/ChemBERTa-77M-MLM")
         model = AutoModel.from_pretrained("DeepChem/ChemBERTa-77M-MLM", use_safetensors=True).to(self.device)
         model.eval()
+        
+        # Get actual embedding dimension from model
+        with torch.no_grad():
+            dummy_input = tokenizer("C", return_tensors="pt", padding=True).to(self.device)
+            dummy_output = model(**dummy_input)
+            embedding_dim = dummy_output.last_hidden_state.shape[-1]
+            print(f"ChemBERTa actual embedding dimension: {embedding_dim}")
         
         embeddings_dict = {}
         

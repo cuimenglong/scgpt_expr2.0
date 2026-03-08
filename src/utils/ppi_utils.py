@@ -49,15 +49,33 @@ class PPINetworkLoader:
         """
         try:
             import mygene
-            logger.info("Using mygene library for ID translation...")
+            logger.info(f"Using mygene library for ID translation ({len(uniprot_ids)} IDs)...")
             mg = mygene.MyGeneInfo()
-            # scopes='uniprot' means input is UniProt ID, fields='symbol' means output is gene symbol
-            results = mg.querymany(uniprot_ids, scopes='uniprot', fields='symbol', species='human')
             
+            # Batch processing for large lists
             mapping = {}
-            for res in results:
-                if 'query' in res and 'symbol' in res:
-                    mapping[res['query']] = res['symbol']
+            batch_size = 2000
+            
+            for i in range(0, len(uniprot_ids), batch_size):
+                batch = uniprot_ids[i:i+batch_size]
+                results = mg.querymany(
+                    batch, 
+                    scopes='uniprot', 
+                    fields='symbol', 
+                    species='human',
+                    verbose=False
+                )
+                
+                for res in results:
+                    # Check if the query was successfully matched
+                    if 'query' in res:
+                        if 'notfound' in res and res['notfound']:
+                            continue
+                        if 'symbol' in res:
+                            mapping[res['query']] = res['symbol']
+                
+                logger.info(f"Translated {len(mapping)} IDs so far...")
+            
             logger.info(f"Successfully translated {len(mapping)} UniProt IDs to gene symbols")
             return mapping
         except ImportError:
@@ -93,9 +111,13 @@ class PPINetworkLoader:
         
         logger.info("Downloading PPI data from OmniPath database...")
         
+        # Try multiple URLs for better reliability
         urls = [
+            # OmniPath direct download
+            f"https://omnipathdb.org/interactions?organism=9606&format=tsv",
+            f"https://omnipathdb.org/interactions?datasets=omnipath&organism=9606&format=tsv",
+            # Alternative format
             f"https://omnipathdb.org/interactions?organism={organism}&format=tsv",
-            f"https://omnipathdb.org/interactions?datasets=omnipath&organism={organism}&format=tsv",
         ]
         
         for url in urls:
@@ -104,8 +126,13 @@ class PPINetworkLoader:
                 response = requests.get(url, timeout=120)
                 response.raise_for_status()
                 
+                # Check if we got actual data
+                if len(response.text.strip()) < 100:
+                    logger.warning(f"Got empty or too small response from {url}")
+                    continue
+                
                 # Save as TSV
-                with open(save_path, 'w') as f:
+                with open(save_path, 'w', encoding='utf-8') as f:
                     f.write(response.text)
                 logger.info(f"PPI data saved to: {save_path}")
                 return save_path
@@ -114,7 +141,7 @@ class PPINetworkLoader:
                 logger.warning(f"Download failed from {url}: {e}")
                 continue
         
-        raise RuntimeError("Cannot download PPI data from OmniPath")
+        raise RuntimeError("Cannot download PPI data from OmniPath. Please check network connection.")
     
     def load_and_translate(self, selected_genes: List[str]) -> None:
         """
@@ -164,6 +191,16 @@ class PPINetworkLoader:
         self.ppi_network = {}
         self.protein_pairs = set()
         selected_genes_upper = {str(g).upper().strip() for g in selected_genes}
+        logger.info(f"Looking for PPI interactions among {len(selected_genes_upper)} genes")
+        
+        # Debug: Show sample of selected genes
+        sample_genes = list(selected_genes_upper)[:10]
+        logger.info(f"Sample selected genes: {sample_genes}")
+        
+        # Debug: Show sample of PPI genes
+        if use_existing_symbols:
+            ppi_sample = df[['source_genesymbol', 'target_genesymbol']].dropna().head(5)
+            logger.info(f"Sample PPI genes from TSV: {ppi_sample.values.tolist()}")
         
         for _, row in df.iterrows():
             if use_existing_symbols:

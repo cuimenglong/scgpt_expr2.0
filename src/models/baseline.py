@@ -20,7 +20,7 @@ class scGPTBaseline(nn.Module):
         d_hid: int = 512,
         nlayers: int = 12,
         dropout: float = 0.1,
-        drug_emb_dim: int = 384,
+        drug_emb_dim: int = 768,  # ChemBERTa-77M-MLM output dimension
         n_celltype: int = 5
     ):
         super().__init__()

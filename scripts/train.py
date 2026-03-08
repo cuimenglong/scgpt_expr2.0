@@ -59,6 +59,9 @@ try:
 except Exception as e:
     print(f"--- torchtext patch failed: {e} ---")
 
+# Import AMP after torchtext patch is applied
+from torch.cuda.amp import autocast, GradScaler  # Mixed precision training
+
 import argparse
 import json
 import random
@@ -190,6 +193,42 @@ def my_collate(batch):
     return c_genes, p_genes, cell_type_ids, drug_embs
 
 
+def save_model_checkpoint(model, save_path, max_retries=3):
+    """
+    Safely save model checkpoint with retry logic
+    """
+    import time
+    
+    # Remove existing file if corrupted
+    if os.path.exists(save_path):
+        try:
+            # Try to load to check if valid
+            torch.load(save_path, map_location='cpu')
+        except:
+            print(f"Warning: Found corrupted checkpoint at {save_path}, removing...")
+            os.remove(save_path)
+    
+    for attempt in range(max_retries):
+        try:
+            torch.save(model.state_dict(), save_path)
+            return True
+        except RuntimeError as e:
+            if attempt < max_retries - 1:
+                print(f"Save attempt {attempt+1} failed: {e}")
+                print(f"Retrying in 5 seconds...")
+                time.sleep(5)
+                # Try to remove corrupted file
+                if os.path.exists(save_path):
+                    try:
+                        os.remove(save_path)
+                    except:
+                        pass
+            else:
+                print(f"Failed to save after {max_retries} attempts")
+                raise
+    return False
+
+
 def train(args):
     """Main training function"""
     
@@ -264,6 +303,23 @@ def train(args):
     print("Loading data...")
     adata = sc.read_h5ad(adata_path)
     
+    # ========== Apply log1p transformation if needed ==========
+    X_max = adata.X.max() if hasattr(adata.X, 'max') else adata.X.toarray().max()
+    if X_max > 30:
+        print(f"Applying log1p transformation (max value: {X_max:.2f})...")
+        sc.pp.log1p(adata)
+    else:
+        print(f"Data appears to be already log1p transformed (max: {X_max:.2f}), skipping log1p")
+    
+    # Save cell_line vocabulary at the START of training (for inference alignment)
+    cell_line_vocab_early = list(adata.obs['cell_line'].unique())
+    cell_line_vocab_early_path = os.path.join(save_dir, "cell_line_vocab_early.pkl")
+    import pickle
+    with open(cell_line_vocab_early_path, 'wb') as f:
+        pickle.dump(cell_line_vocab_early, f)
+    print(f"Cell line vocabulary (training start) saved to: {cell_line_vocab_early_path}")
+    print(f"  Number of cell lines: {len(cell_line_vocab_early)}")
+    
     # For protein/ppi models, convert Ensembl IDs to gene symbols using gene_purifier
     if experiment_type.lower() in ['protein', 'ppi']:
         try:
@@ -316,10 +372,14 @@ def train(args):
     with open(vocab_path, 'r') as f:
         vocab_dict = json.load(f)
     
+    # Get gene IDs - use <unk> for genes not in vocabulary
     gene_ids = torch.tensor(
         [vocab_dict.get(g, vocab_dict.get("<unk>", 0)) for g in selected_genes],
         dtype=torch.long
     ).to(device)
+    
+    # Get valid genes for ESM embedding (genes that exist in vocab)
+    valid_genes = [g for g in selected_genes if g in vocab_dict]
     
     # Load ESM embeddings for protein/ppi models (using generate_protein_embeddings from previous code)
     esm_embeddings = None
@@ -329,7 +389,7 @@ def train(args):
         
         esm_path = config.get('esm_path', '')
         
-        # Create hvg_vocab_dict for selected genes
+        # Create hvg_vocab_dict for selected genes (only include genes in vocab)
         hvg_vocab_dict = {g: vocab_dict[g] for g in selected_genes if g in vocab_dict}
         
         if not esm_path:
@@ -349,9 +409,17 @@ def train(args):
             print(f"Loading ESM embeddings from: {esm_path}")
             esm_matrix = torch.load(esm_path, map_location='cpu')
         
-        # Extract embeddings for selected genes [N_genes, 1280]
+        # Get ESM embedding dimension dynamically
+        esm_dim = esm_matrix.shape[1]
+        print(f"ESM embedding dimension: {esm_dim}")
+        
+        # Extract embeddings for selected genes [N_genes, esm_dim]
+        # Only include genes that exist in vocab_dict (already filtered in valid_genes)
+        if len(valid_genes) < len(selected_genes):
+            print(f"Warning: {len(selected_genes) - len(valid_genes)} genes not found in vocabulary, skipping")
+        
         gene_ids_for_esm = torch.tensor(
-            [vocab_dict[g] for g in selected_genes],
+            [vocab_dict[g] for g in valid_genes],
             dtype=torch.long
         )
         esm_embeddings = esm_matrix[gene_ids_for_esm].to(device)
@@ -369,13 +437,28 @@ def train(args):
     use_knn_matching = experiment_type.lower() == 'metaselection'
     
     # Create dataset with appropriate settings
+    # Enable ChemBERTa drug embeddings by default
+    # Note: log1p is already applied above, so set apply_log1p=False to avoid double transformation
     dataset = H5ADPerturbationDataset(
         adata, 
         drug_to_target_nodes=drug_to_target_gene_ids, 
         device=device,
+        compute_drug_embeddings=True,  # Enable ChemBERTa embeddings
         use_knn_matching=use_knn_matching,
-        metadata_cols=metadata_cols if use_knn_matching else None
+        metadata_cols=metadata_cols if use_knn_matching else None,
+        apply_log1p=False,  # Already applied above
+        apply_normalize=False  # Set to True if needed
     )
+    
+    # Auto-detect drug embedding dimension from dataset
+    detected_drug_emb_dim = None
+    if hasattr(dataset, 'drug_embeddings') and dataset.drug_embeddings:
+        sample_emb = next(iter(dataset.drug_embeddings.values()))
+        detected_drug_emb_dim = sample_emb.shape[0]
+        print(f"Detected drug embedding dimension: {detected_drug_emb_dim}")
+    else:
+        print("Warning: No drug embeddings found, using default dimension 384")
+        detected_drug_emb_dim = 384
     
     # Use custom collate_fn for target_bias
     if use_collate_fn:
@@ -394,22 +477,43 @@ def train(args):
     # Get number of cell types
     n_celltype = len(adata.obs['cell_line'].unique()) + 20
     
-    # Build model kwargs
+    # Build model kwargs - base parameters for all models
+    # Use full vocab to enable pretrained weight loading
+    # Note: ChemBERTa produces 768-dim embeddings
+    
+    # Get vocab dict from gene_processor if available
+    vocab_for_model = vocab_dict
+    if hasattr(gene_processor, 'get_vocab_dict'):
+        processor_vocab = gene_processor.get_vocab_dict()
+        if processor_vocab:
+            vocab_for_model = processor_vocab
+            print(f"Using processor vocab for model: {len(vocab_for_model)} tokens")
+    
     model_kwargs = {
-        'ntokens': len(vocab_dict),
+        'ntokens': len(vocab_for_model),
         'd_model': d_model,
         'nhead': 8,
         'd_hid': d_model,
         'nlayers': 12,
-        'scgpt_layers': 12,
-        'gp_layers': 3,
         'n_celltype': n_celltype,
-        'drug_emb_dim': 384,
+        'drug_emb_dim': detected_drug_emb_dim,
     }
     
-    # Add ESM path if needed
+    # Add scgpt_layers and gp_layers only for protein/ppi models
     if model_name in ['protein', 'ppi']:
-        model_kwargs['esm_dim'] = 1280
+        model_kwargs['scgpt_layers'] = 12
+        model_kwargs['gp_layers'] = 3
+        # Get ESM dimension dynamically from the embeddings matrix
+        if esm_embeddings is not None:
+            model_kwargs['esm_dim'] = esm_embeddings.shape[1]
+        else:
+            model_kwargs['esm_dim'] = 1280  # Fallback
+        print(f"Using ESM dimension: {model_kwargs['esm_dim']}")
+    
+    # Remove nlayers for protein/ppi models (they use scgpt_layers instead)
+    if model_name in ['protein', 'ppi', 'scgptwithvirtualprotein', 'scgptwithvirtualproteinandppi']:
+        if 'nlayers' in model_kwargs:
+            del model_kwargs['nlayers']
     
     # Add PPI adjacency if using PPI model
     if model_name in ['ppi', 'scgptwithvirtualproteinandppi']:
@@ -428,6 +532,7 @@ def train(args):
     model = ModelClass(**model_kwargs).to(device)
     
     # Load pretrained weights if available (using previous code's detailed mapping logic)
+    # NOTE: Load weights BEFORE wrapping with DataParallel to avoid "module." prefix issues
     if os.path.exists(pretrained_path):
         print(f"Loading pretrained weights from {pretrained_path}...")
         
@@ -477,29 +582,51 @@ def train(args):
                 if dp_k in model_dict and v.shape == model_dict[dp_k].shape:
                     matched_dict[dp_k] = v
         
-        # Update model weights
-        model_dict.update(matched_dict)
-        model.load_state_dict(model_dict)
-        
-        # Detailed report
-        scgpt_backbone_count = len([k for k in matched_dict.keys() if "scgpt_transformer" in k or "transformer_encoder" in k])
-        gene_enc_count = len([k for k in matched_dict.keys() if "gene_encoder" in k])
-        
-        print("\n" + "="*50)
-        print(f"Weight Loading Report:")
-        print(f"  - Total matched tensors: {len(matched_dict)}")
-        print(f"  - Transformer backbone layers: {scgpt_backbone_count}")
-        print(f"  - Gene encoder layers: {gene_enc_count}")
-        
-        # Check new modules remain randomly initialized
-        new_modules = ["gp_transformer", "drug_projector", "gene_to_protein_mlp", "esm_projector", "decoder", "meta_encoder"]
-        print(f"  - New modules (should remain random):")
-        for mod in new_modules:
-            mod_params = [k for k in model_dict.keys() if k.startswith(mod)]
-            is_loaded = any(k in matched_dict for k in mod_params)
-            status = "⚠️ Unexpected" if is_loaded else "✅ Random"
-            print(f"    * {mod}: {status}")
-        print("="*50 + "\n")
+        # Load matched weights
+        if matched_dict:
+            # Filter out incompatible layers (different shapes from old checkpoints)
+            incompatible_layers = ['drug_projector', 'esm_projector', 'gene_to_protein_mlp', 
+                                   'gp_transformer', 'meta_encoder', 'decoder']
+            filtered_dict = {k: v for k, v in matched_dict.items() 
+                           if not any(lyr in k for lyr in incompatible_layers)}
+            
+            if len(filtered_dict) < len(matched_dict):
+                skipped = set(matched_dict.keys()) - set(filtered_dict.keys())
+                print(f"  [Skip] Skipping incompatible layers: {skipped}")
+            
+            model.load_state_dict(filtered_dict, strict=False)
+            print(f"Loaded {len(filtered_dict)} pretrained weight(s)")
+            
+            # Detailed report
+            scgpt_backbone_count = len([k for k in matched_dict.keys() if "scgpt_transformer" in k or "transformer_encoder" in k])
+            gene_enc_count = len([k for k in matched_dict.keys() if "gene_encoder" in k])
+            
+            print("\n" + "="*50)
+            print(f"Weight Loading Report:")
+            print(f"  - Total matched tensors: {len(matched_dict)}")
+            print(f"  - Transformer backbone layers: {scgpt_backbone_count}")
+            print(f"  - Gene encoder layers: {gene_enc_count}")
+            
+            # Check new modules remain randomly initialized
+            new_modules = ["gp_transformer", "drug_projector", "gene_to_protein_mlp", "esm_projector", "decoder", "meta_encoder"]
+            print(f"  - New modules (should remain random):")
+            for mod in new_modules:
+                mod_params = [k for k in model_dict.keys() if k.startswith(mod)]
+                is_loaded = any(k in matched_dict for k in mod_params)
+                status = "⚠️ Unexpected" if is_loaded else "✅ Random"
+                print(f"    * {mod}: {status}")
+            print("="*50 + "\n")
+        else:
+            print("No matching pretrained weights found!")
+    
+    # Wrap with DataParallel for multi-GPU training
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs for training!")
+        model = torch.nn.DataParallel(model)
+        device_ids = list(range(torch.cuda.device_count()))
+        print(f"GPU device IDs: {device_ids}")
+    else:
+        print(f"Using single GPU: {device}")
     
     # --- Step 4: Training loop ---
     print(f"\nStarting training for {epochs} epochs...")
@@ -507,8 +634,16 @@ def train(args):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = torch.nn.MSELoss()
     
+    # Initialize GradScaler for mixed precision training
+    scaler = GradScaler()
+    use_amp = True
+    print(f"Mixed precision training (AMP): {use_amp}")
+    
     best_loss = float('inf')
     model.train()
+    
+    # Track epoch-loss for CSV
+    epoch_losses = []
     
     for epoch in range(epochs):
         total_loss = 0
@@ -537,13 +672,14 @@ def train(args):
                 else:
                     target_genes = torch.full((len(target_ids_list), 1), -1, dtype=torch.long).to(device)
                 
-                # Forward pass
-                pred_delta = model(
-                    c_gene=c_gene,
-                    drug_emb=drug_emb,
-                    cell_type_id=cell_type_id,
-                    target_gene_ids=target_genes
-                )
+                # Forward pass with AMP
+                with autocast():
+                    pred_delta = model(
+                        c_gene=c_gene,
+                        drug_emb=drug_emb,
+                        cell_type_id=cell_type_id,
+                        target_gene_ids=target_genes
+                    )
             else:
                 # baseline/protein/ppi/metaselection
                 c_gene = batch['c_gene'].to(device)
@@ -557,13 +693,14 @@ def train(args):
                     if metadata is not None:
                         metadata = metadata.to(device)
                     
-                    pred_delta = model(
-                        gene_ids.unsqueeze(0).expand(c_gene.shape[0], -1),
-                        c_gene,
-                        drug_emb,
-                        cell_type_id,
-                        metadata
-                    )
+                    with autocast():
+                        pred_delta = model(
+                            gene_ids.unsqueeze(0).expand(c_gene.shape[0], -1),
+                            c_gene,
+                            drug_emb,
+                            cell_type_id,
+                            metadata
+                        )
                 elif experiment_type.lower() in ['protein', 'ppi']:
                     # Load ESM embeddings from file (same as used in previous code)
                     if 'esm_embeddings' in locals():
@@ -573,31 +710,36 @@ def train(args):
                         # Fallback: generate random embeddings (should not happen with proper config)
                         print("Warning: ESM embeddings not loaded, using random embeddings")
                         esm_batch = torch.randn(c_gene.shape[0], len(selected_genes), 1280).to(device)
-                    pred_delta = model(
-                        gene_ids.unsqueeze(0).expand(c_gene.shape[0], -1),
-                        c_gene,
-                        drug_emb,
-                        cell_type_id,
-                        esm_batch
-                    )
+                    with autocast():
+                        pred_delta = model(
+                            gene_ids.unsqueeze(0).expand(c_gene.shape[0], -1),
+                            c_gene,
+                            drug_emb,
+                            cell_type_id,
+                            esm_batch
+                        )
                 else:
                     # baseline
-                    pred_delta = model(
-                        gene_ids.unsqueeze(0).expand(c_gene.shape[0], -1),
-                        c_gene,
-                        drug_emb,
-                        cell_type_id
-                    )
+                    with autocast():
+                        pred_delta = model(
+                            gene_ids.unsqueeze(0).expand(c_gene.shape[0], -1),
+                            c_gene,
+                            drug_emb,
+                            cell_type_id
+                        )
             
-            # Calculate loss
-            true_delta = p_gene - c_gene
-            loss = criterion(pred_delta, true_delta)
+            # Calculate loss with AMP
+            with autocast():
+                true_delta = p_gene - c_gene
+                loss = criterion(pred_delta, true_delta)
             
-            # Backward pass
+            # Backward pass with AMP
             optimizer.zero_grad()
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             
             total_loss += loss.item()
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
@@ -605,20 +747,49 @@ def train(args):
         avg_loss = total_loss / len(train_loader)
         print(f"Epoch {epoch+1}/{epochs} - Average Loss: {avg_loss:.6f}")
         
+        # Record epoch-loss
+        epoch_losses.append({'epoch': epoch + 1, 'loss': avg_loss})
+        
         # Save best and last models
         if avg_loss < best_loss:
             best_loss = avg_loss
             best_path = os.path.join(save_dir, "best_model.pt")
             save_model = model.module if isinstance(model, torch.nn.DataParallel) else model
-            torch.save(save_model.state_dict(), best_path)
+            save_model_checkpoint(save_model, best_path)
             print(f"--> Best model updated (Loss: {best_loss:.6f})")
         
         last_path = os.path.join(save_dir, "last_model.pt")
         save_model = model.module if isinstance(model, torch.nn.DataParallel) else model
-        torch.save(save_model.state_dict(), last_path)
+        save_model_checkpoint(save_model, last_path)
     
     print(f"\nTraining complete! Best Loss: {best_loss:.6f}")
     print(f"Models saved to: {save_dir}")
+    
+    # Save epoch-loss to CSV
+    loss_df = pd.DataFrame(epoch_losses)
+    loss_csv_path = os.path.join(save_dir, "epoch_loss.csv")
+    loss_df.to_csv(loss_csv_path, index=False)
+    print(f"Epoch-loss saved to: {loss_csv_path}")
+    
+    # Save cell_line vocabulary for inference
+    cell_line_vocab = list(adata.obs['cell_line'].unique())
+    cell_line_vocab_path = os.path.join(save_dir, "cell_line_vocab.pkl")
+    import pickle
+    with open(cell_line_vocab_path, 'wb') as f:
+        pickle.dump(cell_line_vocab, f)
+    print(f"Cell line vocabulary saved to: {cell_line_vocab_path}")
+    print(f"  Number of cell lines: {len(cell_line_vocab)}")
+
+    # Save drug embeddings for inference
+    if hasattr(dataset, 'drug_embeddings') and dataset.drug_embeddings:
+        drug_emb_save_path = os.path.join(save_dir, "drug_embeddings.pkl")
+        import pickle
+        # Convert tensors to numpy for pickle compatibility
+        drug_emb_dict = {k: v.cpu().numpy() if isinstance(v, torch.Tensor) else v 
+                        for k, v in dataset.drug_embeddings.items()}
+        with open(drug_emb_save_path, 'wb') as f:
+            pickle.dump(drug_emb_dict, f)
+        print(f"Drug embeddings saved to: {drug_emb_save_path}")
     
     # Save training config
     config_info = {
@@ -683,6 +854,8 @@ def main():
     # Training settings
     parser.add_argument('--checkpoint', '-n', type=int, required=True,
                        help='Checkpoint number for saving')
+    parser.add_argument('--gpu-ids', type=str, default=None,
+                       help='GPU IDs to use, e.g., "0,1,2,3" (default: all available)')
     parser.add_argument('--batch-size', '-b', type=int, default=None,
                        help='Batch size')
     parser.add_argument('--lr', type=float, default=None,
@@ -697,6 +870,11 @@ def main():
                        help='Save directory (default: ./checkpoints{n})')
     
     args = parser.parse_args()
+    
+    # Set GPU devices if specified
+    if args.gpu_ids is not None:
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_ids
+        print(f"Using GPU IDs: {args.gpu_ids}")
     
     # Set save_dir if not provided
     if args.save_dir is None:

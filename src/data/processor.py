@@ -4,6 +4,7 @@ Gene Processor Factory - Handles different gene processing strategies for differ
 
 import os
 import sys
+import json
 import numpy as np
 import pandas as pd
 import torch
@@ -44,14 +45,70 @@ class GeneProcessor(ABC):
         print(f"Gene list saved to: {save_path}")
 
 
+def load_esm_embeddings(esm_path: str) -> Dict[str, torch.Tensor]:
+    """
+    Load ESM embeddings from file.
+    Supports two formats:
+    1. Dict format: {gene_name: embedding_tensor} - legacy format
+    2. Tensor format: (N, 1280) tensor + _genes.json mapping - new format
+    
+    Args:
+        esm_path: Path to ESM embeddings file
+        
+    Returns:
+        Dictionary mapping gene names to embedding tensors
+    """
+    if not os.path.exists(esm_path):
+        return {}
+    
+    esm_data = torch.load(esm_path)
+    
+    # Check if it's a dict (legacy format)
+    if isinstance(esm_data, dict):
+        return esm_data
+    
+    # Check if it's a tensor with accompanying JSON mapping
+    if isinstance(esm_data, torch.Tensor):
+        # Try to load gene mapping
+        mapping_path = esm_path.replace('.pt', '_genes.json')
+        if os.path.exists(mapping_path):
+            with open(mapping_path, 'r') as f:
+                gene_to_idx = json.load(f)
+            
+            # Convert tensor to dict
+            esm_dict = {}
+            for gene_name, idx in gene_to_idx.items():
+                if idx < esm_data.shape[0]:
+                    esm_dict[gene_name] = esm_data[idx]
+            return esm_dict
+        else:
+            print(f"Warning: ESM file is tensor but no _genes.json mapping found at {mapping_path}")
+            return {}
+    
+    return {}
+
+
 class BaselineGeneProcessor(GeneProcessor):
     """
-    Baseline processor: Uses only HVG (Highly Variable Genes)
+    Baseline processor: Uses HVG genes from data, but creates model with full scGPT vocab
+    This allows loading pretrained weights while using only data-relevant genes for training
     """
     
     def process(self, adata, config: Dict) -> List[str]:
         n_hvg = config.get('n_hvg', 2000)
+        vocab_path = config.get('vocab_path', './scgpt/tokenizer/default_gene_vocab.json')
         
+        # Load scGPT vocab (for weight loading, not for model input)
+        self.vocab_dict = {}
+        if vocab_path and os.path.exists(vocab_path):
+            with open(vocab_path, 'r') as f:
+                self.vocab_dict = json.load(f)
+            scgpt_genes = [g for g in self.vocab_dict.keys() if g not in {'<pad>', '<unk>', '<eos>'}]
+            print(f"[BaselineGeneProcessor] scGPT vocab loaded: {len(scgpt_genes)} genes")
+        else:
+            print(f"[BaselineGeneProcessor] WARNING: Vocab file not found")
+        
+        # HVG selection
         adata.var_names = [g.upper() for g in adata.var_names]
         sc.pp.highly_variable_genes(
             adata, 
@@ -61,9 +118,23 @@ class BaselineGeneProcessor(GeneProcessor):
         )
         
         hvg_genes = adata.var_names[adata.var.highly_variable].tolist()
-        print(f"[BaselineGeneProcessor] Selected {len(hvg_genes)} HVG genes")
         
-        return hvg_genes
+        # Filter to genes that exist in vocab (if vocab loaded)
+        if self.vocab_dict:
+            final_genes = [g for g in hvg_genes if g in self.vocab_dict]
+            missing = len(hvg_genes) - len(final_genes)
+            if missing > 0:
+                print(f"[BaselineGeneProcessor] {missing} HVG genes not in vocab, using {len(final_genes)}")
+        else:
+            final_genes = hvg_genes
+        
+        print(f"[BaselineGeneProcessor] Selected {len(final_genes)} HVG genes")
+        
+        return final_genes
+    
+    def get_vocab_dict(self) -> Dict:
+        """Get full vocab dict for model construction"""
+        return getattr(self, 'vocab_dict', {})
     
     def get_inference_genes(self, checkpoint_dir: str) -> List[str]:
         genes_path = os.path.join(checkpoint_dir, "selected_genes.csv")
@@ -95,12 +166,18 @@ class ProteinGeneProcessor(GeneProcessor):
         # 2. Load ESM embeddings
         esm_genes = set()
         if esm_path and os.path.exists(esm_path):
-            esm_data = torch.load(esm_path)
+            esm_data = load_esm_embeddings(esm_path)
             esm_genes = set(esm_data.keys())
             print(f"[ProteinGeneProcessor] ESM embedded genes: {len(esm_genes)}")
+        else:
+            print(f"[ProteinGeneProcessor] WARNING: ESM file not found at {esm_path}")
+            print("[ProteinGeneProcessor] Will use all HVG genes (no ESM filtering)")
         
         # 3. Get intersection
-        final_genes = list(hvg_genes & esm_genes)
+        if esm_genes:
+            final_genes = list(hvg_genes & esm_genes)
+        else:
+            final_genes = list(hvg_genes)  # Use all HVG if no ESM
         print(f"[ProteinGeneProcessor] Final genes (HVG ∩ ESM): {len(final_genes)}")
         
         return final_genes
@@ -142,12 +219,18 @@ class PPIGeneProcessor(GeneProcessor):
         # 2. Load ESM embeddings
         esm_genes = set()
         if esm_path and os.path.exists(esm_path):
-            esm_data = torch.load(esm_path)
+            esm_data = load_esm_embeddings(esm_path)
             esm_genes = set(esm_data.keys())
             print(f"[PPIGeneProcessor] ESM embedded genes: {len(esm_genes)}")
+        else:
+            print(f"[PPIGeneProcessor] WARNING: ESM file not found at {esm_path}")
+            print("[PPIGeneProcessor] Will use all HVG genes (no ESM filtering)")
         
         # 3. Get ESM covered genes
-        esm_covered = hvg_genes & esm_genes
+        if esm_genes:
+            esm_covered = hvg_genes & esm_genes
+        else:
+            esm_covered = hvg_genes  # Use all HVG if no ESM
         print(f"[PPIGeneProcessor] ESM covered genes: {len(esm_covered)}")
         
         # 4. Build PPI network using new PPINetworkLoader

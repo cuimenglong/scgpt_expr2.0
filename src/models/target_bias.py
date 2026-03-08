@@ -20,7 +20,7 @@ class scGPTWithTargetBias(nn.Module):
         d_hid: int = 512,
         nlayers: int = 12,
         dropout: float = 0.1,
-        drug_emb_dim: int = 384,
+        drug_emb_dim: int = 768,  # ChemBERTa-77M-MLM output dimension
         n_celltype: int = 5,
         target_bias_value: float = 5.0,
         gene_ids: Optional[torch.Tensor] = None
@@ -79,31 +79,30 @@ class scGPTWithTargetBias(nn.Module):
         # Concatenate Drug Token
         x = torch.cat([d_emb, g_emb], dim=1)  # [B, L+1, D]
         
-        # 2. Build Bias Matrix
-        bias = torch.zeros(batch_size, full_len, full_len, device=gene_ids.device)
+        # 2. Build Attention Bias Matrix
+        # PyTorch TransformerEncoderLayer uses src_mask with shape [seq, seq]
+        # We average the target bias across the batch for simplicity
+        attn_bias = torch.zeros(full_len, full_len, device=gene_ids.device)
         
         if target_gene_ids is not None:
+            # Collect target bias positions across batch
             for i in range(batch_size):
                 valid_tpts = target_gene_ids[i][target_gene_ids[i] != -1]
                 if len(valid_tpts) > 0:
                     mask = torch.isin(gene_ids[i], valid_tpts)
-                    t_idx = torch.where(mask)[0] + 1
+                    t_idx = torch.where(mask)[0] + 1  # +1 for drug token
                     if len(t_idx) > 0:
-                        bias[i, t_idx, 0] = self.target_bias_value
-                        bias[i, 0, t_idx] = self.target_bias_value
-                        
-        # 3. Padding Mask
-        if src_key_padding_mask is not None:
-            full_p_mask = torch.cat([
-                torch.zeros(batch_size, 1, dtype=torch.bool, device=gene_ids.device), 
-                src_key_padding_mask
-            ], dim=1)
-            p_bias = full_p_mask.unsqueeze(1).expand(-1, full_len, -1)
-            bias = bias.masked_fill(p_bias, float("-inf"))
-            
-        # 4. Transformer Encoder
-        bias = bias.repeat_interleave(self.nhead, dim=0)
-        output = self.transformer_encoder(x, mask=bias)
+                        # Drug token (index 0) <-> Target genes
+                        attn_bias[t_idx, 0] += self.target_bias_value / batch_size
+                        attn_bias[0, t_idx] += self.target_bias_value / batch_size
         
-        # 5. Decode
+        # 3. Transformer Encoder
+        # Use src_key_padding_mask for padding, attn_bias for target bias
+        output = self.transformer_encoder(
+            x, 
+            src_key_padding_mask=src_key_padding_mask,
+            src_mask=attn_bias
+        )
+        
+        # 4. Decode
         return self.decoder(output[:, 1:, :]).squeeze(-1)
