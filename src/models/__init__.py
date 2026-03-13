@@ -7,11 +7,13 @@ from .protein import scGPTWithVirtualProtein
 from .ppi import scGPTWithVirtualProteinAndPPI
 from .target_bias import scGPTWithTargetBias
 from .metaselection import scGPTWithMetadata
+from .enhanced import scGPTEnhanced
 
 __all__ = [
     'scGPTBaseline',
-    'scGPTWithVirtualProtein', 
+    'scGPTWithVirtualProtein',
     'scGPTWithVirtualProteinAndPPI',
     'scGPTWithTargetBias',
-    'scGPTWithMetadata'
+    'scGPTWithMetadata',
+    'scGPTEnhanced',
 ]

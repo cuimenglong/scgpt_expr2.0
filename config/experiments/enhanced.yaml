@@ -1,0 +1,58 @@
+# Enhanced experiment configuration
+# Combines filtered PPI + pathway priors + drug-target propagation + population decomposition
+
+experiment_type: "enhanced"
+model: "enhanced"
+
+# Data paths
+data_path: "/home/dataset-assist-0/cuimenglong/workspace/data/tahoe/experiment/processed/train.h5ad"
+test_data_path: "/home/dataset-assist-0/cuimenglong/workspace/data/tahoe/experiment/processed/test.h5ad"
+drug_meta_path: "/home/dataset-assist-0/cuimenglong/workspace/data/tahoe/drug_metadata.parquet"
+vocab_path: "./scgpt/tokenizer/default_gene_vocab.json"
+pretrained_path: "/home/dataset-assist-0/cuimenglong/workspace/data/scgpt/best_model.pt"
+
+# ESM embeddings
+esm_path: "./protein_esm_embeddings.pt"
+
+# PPI settings (enhanced with filtering)
+use_ppi: true
+filter_ppi: true
+ppi_min_evidence: 2
+ppi_weighted: true
+ppi_tsv_path: null
+ppi_cache_dir: "./data"
+
+# Pathway settings
+use_pathways: true
+pathway_collection: "C2"
+pathway_subcollection: "CP:KEGG"
+pathway_gmt_path: null
+pathway_cache_dir: "./data"
+pathway_bias_scale: 1.0
+
+# Drug-target settings
+target_bias_value: 3.0
+target_propagation_decay: 0.5
+
+# Population decomposition
+use_population_decomposition: true
+
+# Model settings
+d_model: 512
+n_hvg: 2000
+scgpt_layers: 12
+gp_layers: 3
+
+# Loss function
+loss_type: "enhanced"
+mse_weight: 1.0
+pearson_weight: 0.5
+direction_weight: 0.1
+
+# Training settings
+batch_size: 64
+lr: 0.0001
+epochs: 30
+n_controls: 5
+scheduler: "cosine_warmup"
+warmup_epochs: 5

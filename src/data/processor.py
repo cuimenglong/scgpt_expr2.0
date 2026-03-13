@@ -270,17 +270,81 @@ class PPIGeneProcessor(GeneProcessor):
         return self.ppi_stats, self.ppi_adjacency
 
 
+class EnhancedGeneProcessor(PPIGeneProcessor):
+    """
+    Enhanced processor: HVG + ESM + Filtered PPI + Pathway priors.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.pathway_adjacency = None
+        self.pathway_names = None
+
+    def process(self, adata, config: Dict) -> List[str]:
+        selected_genes = super().process(adata, config)
+
+        # Re-create PPI with filtering if requested
+        if config.get('filter_ppi', False):
+            from ..utils.ppi_utils import PPINetworkLoader
+            ppi_loader = PPINetworkLoader(
+                tsv_path=config.get('ppi_tsv_path'),
+                cache_dir=config.get('ppi_cache_dir', './data')
+            )
+            ppi_loader.load_and_translate(
+                selected_genes,
+                min_evidence_count=config.get('ppi_min_evidence', 2),
+                interaction_types=config.get('ppi_interaction_types', None)
+            )
+            self.ppi_stats = ppi_loader.get_ppi_statistics(selected_genes)
+            print(f"[EnhancedGeneProcessor] Filtered PPI: {self.ppi_stats['ppi_edges']} edges")
+
+            if config.get('ppi_weighted', True):
+                self.ppi_adjacency = ppi_loader.create_weighted_adjacency_matrix(
+                    selected_genes, normalize=True, include_self_loop=False
+                )
+            else:
+                self.ppi_adjacency = ppi_loader.create_adjacency_matrix(
+                    selected_genes, include_self_loop=False
+                )
+
+        # Build pathway data
+        if config.get('use_pathways', True):
+            try:
+                from ..utils.pathway_utils import PathwayLoader
+                pathway_loader = PathwayLoader(cache_dir=config.get('pathway_cache_dir', './data'))
+                gmt_path = config.get('pathway_gmt_path', None)
+                if gmt_path:
+                    pathway_loader.load_from_gmt(gmt_path)
+                else:
+                    pathway_loader.load_msigdb(
+                        collection=config.get('pathway_collection', 'C2'),
+                        subcollection=config.get('pathway_subcollection', 'CP:KEGG')
+                    )
+                self.pathway_adjacency = pathway_loader.build_co_pathway_adjacency(selected_genes)
+                _, self.pathway_names = pathway_loader.build_pathway_matrix(selected_genes)
+                print(f"[EnhancedGeneProcessor] Pathways: {len(self.pathway_names)} active, "
+                      f"{np.count_nonzero(self.pathway_adjacency) // 2} co-pathway pairs")
+            except Exception as e:
+                print(f"[EnhancedGeneProcessor] Pathway loading failed: {e}, continuing without")
+
+        return selected_genes
+
+    def get_pathway_data(self):
+        return self.pathway_adjacency, self.pathway_names
+
+
 class GeneProcessorFactory:
     """
     Factory class for creating gene processors
     """
-    
+
     _processors = {
         'baseline': BaselineGeneProcessor,
         'protein': ProteinGeneProcessor,
         'ppi': PPIGeneProcessor,
-        'target_bias': BaselineGeneProcessor,  # Same as baseline - uses HVG
-        'metaselection': BaselineGeneProcessor,  # Same as baseline - uses HVG
+        'target_bias': BaselineGeneProcessor,
+        'metaselection': BaselineGeneProcessor,
+        'enhanced': EnhancedGeneProcessor,
     }
     
     @classmethod
@@ -307,8 +371,9 @@ class GeneProcessorFactory:
 # Export
 __all__ = [
     'GeneProcessor',
-    'BaselineGeneProcessor', 
+    'BaselineGeneProcessor',
     'ProteinGeneProcessor',
     'PPIGeneProcessor',
+    'EnhancedGeneProcessor',
     'GeneProcessorFactory'
 ]

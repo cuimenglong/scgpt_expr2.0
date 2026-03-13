@@ -76,11 +76,12 @@ import anndata as ad
 
 # Import src modules
 from src.models import (
-    scGPTBaseline, 
-    scGPTWithVirtualProtein, 
+    scGPTBaseline,
+    scGPTWithVirtualProtein,
     scGPTWithVirtualProteinAndPPI,
     scGPTWithTargetBias,
-    scGPTWithMetadata
+    scGPTWithMetadata,
+    scGPTEnhanced
 )
 
 
@@ -92,6 +93,7 @@ def get_model_class(model_name: str):
         'ppi': scGPTWithVirtualProteinAndPPI,
         'target_bias': scGPTWithTargetBias,
         'metaselection': scGPTWithMetadata,
+        'enhanced': scGPTEnhanced,
     }
     
     model_name_lower = model_name.lower()
@@ -165,15 +167,7 @@ def prepare_inference_data(test_h5ad_path: str, drug_meta_path: str, selected_ge
         drug_meta = pd.read_csv(drug_meta_path)
     else:
         raise ValueError(f"Unsupported drug meta format: {drug_meta_path}")
-    
-    # Build core expression matrix for all samples
-    core_X = np.zeros((adata_full.n_obs, n_core), dtype=np.float32)
-    for i, col_idx in enumerate(core_gene_idx_in_full):
-        val = adata_full.X[:, col_idx]
-        if hasattr(val, 'toarray'):
-            val = val.toarray().flatten()
-        core_X[:, i] = val
-    
+
     # ========== Build DMSO control pool ==========
     control_drug_name = "DMSO_TF"
     control_pool = {}
@@ -226,12 +220,19 @@ def run_inference(args, config=None):
     if not os.path.exists(selected_genes_path):
         raise FileNotFoundError(f"Selected genes file not found: {selected_genes_path}")
     
-    # Load PPI adjacency if exists (for PPI model)
+    # Load PPI adjacency if exists (for PPI/enhanced model)
     ppi_adjacency = None
+    pathway_adjacency = None
     ppi_path = os.path.join(checkpoint_dir, "ppi_adjacency.npy")
-    if os.path.exists(ppi_path) and args.model == 'ppi':
+    if os.path.exists(ppi_path) and args.model in ['ppi', 'enhanced']:
         print(f"Loading PPI adjacency: {ppi_path}")
         ppi_adjacency = np.load(ppi_path)
+
+    # Load pathway adjacency if exists (for enhanced model)
+    pathway_path = os.path.join(checkpoint_dir, "pathway_adjacency.npy")
+    if os.path.exists(pathway_path) and args.model == 'enhanced':
+        print(f"Loading pathway adjacency: {pathway_path}")
+        pathway_adjacency = np.load(pathway_path)
     
     # Prepare data
     print("Preparing inference data...")
@@ -265,9 +266,9 @@ def run_inference(args, config=None):
     }
     
     # Add model-specific parameters
-    if args.model in ['protein', 'ppi']:
-        model_kwargs['scgpt_layers'] = 12
-        model_kwargs['gp_layers'] = 3
+    if args.model in ['protein', 'ppi', 'enhanced']:
+        model_kwargs['scgpt_layers'] = config.get('scgpt_layers', 12)
+        model_kwargs['gp_layers'] = config.get('gp_layers', 3)
     elif args.model in ['baseline', 'metaselection', 'target_bias']:
         model_kwargs['nlayers'] = 12
     else:
@@ -277,7 +278,7 @@ def run_inference(args, config=None):
     esm_embeddings = None
     esm_path = None
     
-    if args.model in ['protein', 'ppi']:
+    if args.model in ['protein', 'ppi', 'enhanced']:
         # Try to load ESM embeddings from config or checkpoint directory
         esm_path = getattr(args, 'esm_path', None)
         if not esm_path:
@@ -316,7 +317,16 @@ def run_inference(args, config=None):
     # Add PPI adjacency for ppi model
     if args.model == 'ppi':
         model_kwargs['ppi_adjacency'] = ppi_adjacency
-    
+
+    # Add enhanced-specific params
+    if args.model == 'enhanced':
+        model_kwargs['ppi_adjacency'] = ppi_adjacency
+        model_kwargs['pathway_adjacency'] = pathway_adjacency
+        model_kwargs['pathway_bias_scale'] = config.get('pathway_bias_scale', 1.0)
+        model_kwargs['target_bias_value'] = config.get('target_bias_value', 3.0)
+        model_kwargs['target_propagation_decay'] = config.get('target_propagation_decay', 0.5)
+        model_kwargs['use_population_decomposition'] = config.get('use_population_decomposition', True)
+
     # Add target_bias params
     if args.model == 'target_bias':
         # Load gene_ids for target_bias model (using actual_gene_list)
@@ -452,6 +462,19 @@ def run_inference(args, config=None):
                     t_ids.append(vocab_dict[t_upper])
             if len(t_ids) > 0:
                 drug_to_target_gene_ids[drug] = t_ids
+
+    # Build drug-to-target-indices for enhanced model
+    drug_to_target_indices = {}
+    if args.model == 'enhanced' and args.drug_meta:
+        gene_name_to_idx = {g.upper(): i for i, g in enumerate(actual_gene_list)}
+        for _, row in drug_meta.iterrows():
+            drug = row['drug']
+            targets = str(row['targets']).split(',') if pd.notna(row.get('targets', '')) else []
+            indices = [gene_name_to_idx[t.upper().strip()] for t in targets
+                       if t.upper().strip() in gene_name_to_idx]
+            if indices:
+                drug_to_target_indices[drug] = indices
+        print(f"Enhanced drug-target mapping: {len(drug_to_target_indices)} drugs with targets")
     
     # Simplified inference loop
     # Precompute cell line to ID mapping (same as training)
@@ -635,6 +658,23 @@ def run_inference(args, config=None):
                                 target_gene_ids=target_tensor
                             )
                             pred_delta = pred.cpu().numpy().squeeze()
+                            pred_expr = c_gene_expr.cpu().numpy().squeeze() + pred_delta
+                        elif args.model == 'enhanced':
+                            batch_gene_ids = gene_ids.unsqueeze(0)
+                            # Build target_gene_mask for this drug
+                            target_gene_mask = torch.zeros(1, len(actual_gene_list), device=device)
+                            if dr in drug_to_target_indices:
+                                for idx in drug_to_target_indices[dr]:
+                                    target_gene_mask[0, idx] = 1.0
+                            esm_batch = esm_embeddings.unsqueeze(0)
+                            pred_delta = model(
+                                batch_gene_ids,
+                                c_gene_expr,
+                                drug_emb,
+                                cell_type_id_tensor,
+                                esm_batch,
+                                target_gene_mask=target_gene_mask
+                            ).cpu().numpy().squeeze()
                             pred_expr = c_gene_expr.cpu().numpy().squeeze() + pred_delta
                         elif args.model in ['protein', 'ppi']:
                             batch_gene_ids = gene_ids.unsqueeze(0)

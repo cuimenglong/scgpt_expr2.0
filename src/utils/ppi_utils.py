@@ -143,65 +143,98 @@ class PPINetworkLoader:
         
         raise RuntimeError("Cannot download PPI data from OmniPath. Please check network connection.")
     
-    def load_and_translate(self, selected_genes: List[str]) -> None:
+    def load_and_translate(self, selected_genes: List[str],
+                          min_evidence_count: int = 0,
+                          interaction_types: Optional[List[str]] = None) -> None:
         """
         Load PPI network and translate to gene symbols
-        
+
         Args:
             selected_genes: List of selected gene symbols
+            min_evidence_count: Minimum literature references to keep (0 = no filtering)
+            interaction_types: List of interaction types to keep (None = all)
         """
-        # Use default path if not specified
         tsv_path = self.tsv_path
         if tsv_path is None:
             tsv_path = os.path.join(self.cache_dir, "omnipath_ppi.tsv")
-        
-        # Download if not exists
+
         if not os.path.exists(tsv_path):
             logger.info("PPI file not found locally, downloading from OmniPath...")
             tsv_path = self.download_omnipath(save_path=tsv_path)
-        
+
         logger.info(f"Loading PPI data from: {tsv_path}")
         df = pd.read_csv(tsv_path, sep='\t', low_memory=False)
         logger.info(f"Loaded {len(df)} interaction records")
-        
-        # Check if TSV already contains gene symbol columns
+
+        # --- Filtering by evidence count ---
+        if min_evidence_count > 0:
+            ref_col = None
+            for col_name in ['n_references', 'n_resources', 'references']:
+                if col_name in df.columns:
+                    ref_col = col_name
+                    break
+            if ref_col:
+                before = len(df)
+                df = df[df[ref_col] >= min_evidence_count].copy()
+                logger.info(f"Filtered by {ref_col} >= {min_evidence_count}: {before} -> {len(df)}")
+            else:
+                logger.warning("No evidence count column found, skipping evidence filtering")
+
+        # --- Filtering by interaction type ---
+        if interaction_types:
+            type_col = None
+            for col_name in ['type', 'interaction_type', 'consensus_direction']:
+                if col_name in df.columns:
+                    type_col = col_name
+                    break
+            if type_col:
+                before = len(df)
+                df = df[df[type_col].isin(interaction_types)].copy()
+                logger.info(f"Filtered by {type_col} in {interaction_types}: {before} -> {len(df)}")
+            else:
+                logger.warning("No interaction type column found, skipping type filtering")
+
+        # Store filtered DataFrame for weighted adjacency
+        self.interaction_df = df
+
         if 'source_genesymbol' in df.columns and 'target_genesymbol' in df.columns:
             logger.info("TSV contains gene symbol columns, using directly.")
             uniprot_to_symbol = {}
             use_existing_symbols = True
         else:
             use_existing_symbols = False
-            # Get unique UniProt IDs
             all_uniprots = list(
-                set(df['source'].unique().astype(str)) | 
+                set(df['source'].unique().astype(str)) |
                 set(df['target'].unique().astype(str))
             )
             logger.info(f"Found {len(all_uniprots)} unique UniProt IDs, translating...")
-            
-            # Translate using mygene
             uniprot_to_symbol = self._get_uniprot_mapping_via_mygene(all_uniprots)
-            
             if not uniprot_to_symbol:
                 raise RuntimeError(
                     "All ID translation methods failed. Please check network connection "
                     "or install mygene: pip install mygene"
                 )
-        
-        # Build network
+
         self.ppi_network = {}
         self.protein_pairs = set()
+        self._edge_weights = {}
         selected_genes_upper = {str(g).upper().strip() for g in selected_genes}
         logger.info(f"Looking for PPI interactions among {len(selected_genes_upper)} genes")
-        
-        # Debug: Show sample of selected genes
+
         sample_genes = list(selected_genes_upper)[:10]
         logger.info(f"Sample selected genes: {sample_genes}")
-        
-        # Debug: Show sample of PPI genes
+
         if use_existing_symbols:
             ppi_sample = df[['source_genesymbol', 'target_genesymbol']].dropna().head(5)
             logger.info(f"Sample PPI genes from TSV: {ppi_sample.values.tolist()}")
-        
+
+        # Determine weight column
+        weight_col = None
+        for col_name in ['n_references', 'n_resources']:
+            if col_name in df.columns:
+                weight_col = col_name
+                break
+
         for _, row in df.iterrows():
             if use_existing_symbols:
                 s_src_raw = row['source_genesymbol']
@@ -209,14 +242,13 @@ class PPINetworkLoader:
             else:
                 s_src_raw = uniprot_to_symbol.get(str(row['source']))
                 s_tgt_raw = uniprot_to_symbol.get(str(row['target']))
-            
+
             if pd.isna(s_src_raw) or pd.isna(s_tgt_raw):
                 continue
-            
+
             s_src = str(s_src_raw).upper().strip()
             s_tgt = str(s_tgt_raw).upper().strip()
-            
-            # Only keep interactions where both genes are in selected genes
+
             if s_src in selected_genes_upper and s_tgt in selected_genes_upper:
                 if s_src == s_tgt:
                     continue
@@ -224,11 +256,19 @@ class PPINetworkLoader:
                     self.ppi_network[s_src] = set()
                 if s_tgt not in self.ppi_network:
                     self.ppi_network[s_tgt] = set()
-                    
+
                 self.ppi_network[s_src].add(s_tgt)
                 self.ppi_network[s_tgt].add(s_src)
-                self.protein_pairs.add(tuple(sorted((s_src, s_tgt))))
-        
+
+                pair_key = tuple(sorted((s_src, s_tgt)))
+                self.protein_pairs.add(pair_key)
+
+                if weight_col and pd.notna(row.get(weight_col)):
+                    w = float(row[weight_col])
+                    self._edge_weights[pair_key] = max(self._edge_weights.get(pair_key, 0), w)
+                else:
+                    self._edge_weights[pair_key] = max(self._edge_weights.get(pair_key, 0), 1.0)
+
         logger.info(
             f"PPI network built: {len(self.ppi_network)} genes, "
             f"{len(self.protein_pairs)} interactions"
@@ -294,8 +334,55 @@ class PPINetworkLoader:
         
         return adj
     
+    def create_weighted_adjacency_matrix(
+        self,
+        gene_list: List[str],
+        normalize: bool = True,
+        include_self_loop: bool = False
+    ) -> np.ndarray:
+        """
+        Create confidence-weighted adjacency matrix (continuous values).
+
+        Args:
+            gene_list: List of genes in order
+            normalize: If True, scale weights to [0, 1]
+            include_self_loop: Whether to include self-loops
+
+        Returns:
+            Weighted adjacency matrix (n_genes x n_genes)
+        """
+        num_genes = len(gene_list)
+        gene_to_idx = {str(g).upper().strip(): i for i, g in enumerate(gene_list)}
+
+        adj = np.zeros((num_genes, num_genes), dtype=np.float32)
+
+        if self.ppi_network and hasattr(self, '_edge_weights'):
+            for pair_key, weight in self._edge_weights.items():
+                s1, s2 = pair_key
+                if s1 in gene_to_idx and s2 in gene_to_idx:
+                    adj[gene_to_idx[s1], gene_to_idx[s2]] = weight
+                    adj[gene_to_idx[s2], gene_to_idx[s1]] = weight
+        elif self.ppi_network:
+            for s1, neighbors in self.ppi_network.items():
+                if s1 in gene_to_idx:
+                    for s2 in neighbors:
+                        if s2 in gene_to_idx:
+                            adj[gene_to_idx[s1], gene_to_idx[s2]] = 1.0
+
+        if normalize:
+            max_val = adj.max()
+            if max_val > 0:
+                adj = adj / max_val
+
+        if include_self_loop:
+            np.fill_diagonal(adj, 1.0)
+
+        n_edges = np.count_nonzero(adj) // 2
+        logger.info(f"Weighted adjacency: {num_genes} genes, {n_edges} edges, max={adj.max():.3f}")
+        return adj
+
     def create_bidirectional_attention_mask(
-        self, 
+        self,
         gene_list: List[str]
     ) -> np.ndarray:
         """

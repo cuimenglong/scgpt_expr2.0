@@ -1,7 +1,7 @@
 """
 Unified Training Script for scGPT Perturbation Experiments
 
-Supports: baseline, protein, ppi, target_bias, metaselection
+Supports: baseline, protein, ppi, target_bias, metaselection, enhanced
 
 Usage:
     # Single experiment
@@ -77,12 +77,15 @@ import scanpy as sc
 import pandas as pd
 
 # Import src modules
+import math
+import torch.nn.functional as F
 from src.models import (
-    scGPTBaseline, 
-    scGPTWithVirtualProtein, 
+    scGPTBaseline,
+    scGPTWithVirtualProtein,
     scGPTWithVirtualProteinAndPPI,
     scGPTWithTargetBias,
-    scGPTWithMetadata
+    scGPTWithMetadata,
+    scGPTEnhanced
 )
 from src.data import H5ADPerturbationDataset, GeneProcessorFactory
 
@@ -121,6 +124,8 @@ def get_model_class(model_name: str):
         'scgptwithtargetbias': scGPTWithTargetBias,
         'metaselection': scGPTWithMetadata,
         'scgptwithmetadata': scGPTWithMetadata,
+        'enhanced': scGPTEnhanced,
+        'scgptenhanced': scGPTEnhanced,
     }
     
     model_name_lower = model_name.lower()
@@ -191,6 +196,48 @@ def my_collate(batch):
     
     # For baseline/protein/ppi: no target_ids
     return c_genes, p_genes, cell_type_ids, drug_embs
+
+
+def compute_enhanced_loss(pred_delta, true_delta, mse_weight=1.0, pearson_weight=0.5, direction_weight=0.1):
+    """Combined loss: MSE + (1 - Pearson) + Direction BCE"""
+    mse_loss = F.mse_loss(pred_delta, true_delta)
+
+    # Pearson correlation loss (differentiable, per-sample then average)
+    pred_c = pred_delta - pred_delta.mean(dim=1, keepdim=True)
+    true_c = true_delta - true_delta.mean(dim=1, keepdim=True)
+    pred_n = pred_c / (pred_c.norm(dim=1, keepdim=True) + 1e-8)
+    true_n = true_c / (true_c.norm(dim=1, keepdim=True) + 1e-8)
+    pearson_corr = (pred_n * true_n).sum(dim=1).mean()
+    pearson_loss = 1.0 - pearson_corr
+
+    # Direction loss: soft sign via sigmoid(10x)
+    pred_sign = torch.sigmoid(pred_delta * 10)
+    true_sign = (true_delta > 0).float()
+    direction_loss = F.binary_cross_entropy(pred_sign, true_sign)
+
+    total = mse_weight * mse_loss + pearson_weight * pearson_loss + direction_weight * direction_loss
+    return total, {'mse': mse_loss.item(), 'pearson_loss': pearson_loss.item(), 'direction_loss': direction_loss.item()}
+
+
+def create_scheduler(optimizer, config):
+    """Create learning rate scheduler based on config"""
+    scheduler_type = config.get('scheduler', 'none')
+    if scheduler_type == 'cosine_warmup':
+        warmup_epochs = config.get('warmup_epochs', 5)
+        total_epochs = config.get('epochs', 30)
+
+        def lr_lambda(epoch):
+            if epoch < warmup_epochs:
+                return (epoch + 1) / warmup_epochs
+            progress = (epoch - warmup_epochs) / max(total_epochs - warmup_epochs, 1)
+            return 0.5 * (1 + math.cos(math.pi * progress))
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    elif scheduler_type == 'cosine':
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=config.get('epochs', 30)
+        )
+    return None
 
 
 def save_model_checkpoint(model, save_path, max_retries=3):
@@ -321,7 +368,7 @@ def train(args):
     print(f"  Number of cell lines: {len(cell_line_vocab_early)}")
     
     # For protein/ppi models, convert Ensembl IDs to gene symbols using gene_purifier
-    if experiment_type.lower() in ['protein', 'ppi']:
+    if experiment_type.lower() in ['protein', 'ppi', 'enhanced']:
         try:
             from src.utils.gene_purifier import convert_with_gseapy
             print("Converting Ensembl IDs to gene symbols...")
@@ -343,7 +390,17 @@ def train(args):
         'esm_path': config.get('esm_path', ''),
         'use_ppi': config.get('use_ppi', True),
         'ppi_tsv_path': config.get('ppi_tsv_path', None),
-        'ppi_cache_dir': config.get('ppi_cache_dir', './data')
+        'ppi_cache_dir': config.get('ppi_cache_dir', './data'),
+        # Enhanced-specific settings
+        'filter_ppi': config.get('filter_ppi', False),
+        'ppi_min_evidence': config.get('ppi_min_evidence', 2),
+        'ppi_weighted': config.get('ppi_weighted', True),
+        'ppi_interaction_types': config.get('ppi_interaction_types', None),
+        'use_pathways': config.get('use_pathways', False),
+        'pathway_collection': config.get('pathway_collection', 'C2'),
+        'pathway_subcollection': config.get('pathway_subcollection', 'CP:KEGG'),
+        'pathway_gmt_path': config.get('pathway_gmt_path', None),
+        'pathway_cache_dir': config.get('pathway_cache_dir', './data'),
     }
     selected_genes = gene_processor.process(adata, gene_config)
     
@@ -354,9 +411,10 @@ def train(args):
     gene_list_path = os.path.join(save_dir, "selected_genes.csv")
     gene_processor.save_gene_list(selected_genes, gene_list_path)
     
-    # Get PPI data if using PPI model
+    # Get PPI data if using PPI or enhanced model
     ppi_adjacency = None
-    if experiment_type.lower() == 'ppi':
+    pathway_adjacency = None
+    if experiment_type.lower() in ['ppi', 'enhanced']:
         if hasattr(gene_processor, 'get_ppi_data'):
             ppi_stats, ppi_adjacency = gene_processor.get_ppi_data()
             if ppi_stats:
@@ -364,6 +422,12 @@ def train(args):
                     json.dump(ppi_stats, f, indent=2)
             if ppi_adjacency is not None:
                 np.save(os.path.join(save_dir, "ppi_adjacency.npy"), ppi_adjacency)
+        # Get pathway data for enhanced model
+        if hasattr(gene_processor, 'get_pathway_data'):
+            pathway_adjacency, pathway_names = gene_processor.get_pathway_data()
+            if pathway_adjacency is not None:
+                np.save(os.path.join(save_dir, "pathway_adjacency.npy"), pathway_adjacency)
+                print(f"Pathway adjacency saved: shape {pathway_adjacency.shape}")
     
     # --- Step 2: Prepare data for training ---
     print("Preparing dataset...")
@@ -383,7 +447,7 @@ def train(args):
     
     # Load ESM embeddings for protein/ppi models (using generate_protein_embeddings from previous code)
     esm_embeddings = None
-    if experiment_type.lower() in ['protein', 'ppi']:
+    if experiment_type.lower() in ['protein', 'ppi', 'enhanced']:
         # Import the ESM embedding generation function
         from src.utils.esm_embeddings import generate_protein_embeddings, load_esm_embeddings
         
@@ -428,10 +492,27 @@ def train(args):
     # Prepare drug targets for target_bias experiment
     drug_to_target_gene_ids = {}
     use_collate_fn = False
-    
+    drug_to_target_indices = {}  # For enhanced model: drug -> indices in selected_genes
+
     if experiment_type.lower() == 'target_bias':
         drug_to_target_gene_ids = prepare_drug_targets(drug_meta_path, adata, vocab_dict)
         use_collate_fn = True
+
+    # Build drug-to-target-gene-index mapping for enhanced model
+    if experiment_type.lower() == 'enhanced' and drug_meta_path and os.path.exists(drug_meta_path):
+        drug_meta = pd.read_parquet(drug_meta_path)
+        gene_name_to_idx = {g.upper(): i for i, g in enumerate(selected_genes)}
+        actual_drugs = set(adata.obs['drug'].unique())
+        for _, row in drug_meta.iterrows():
+            drug = row['drug']
+            if drug not in actual_drugs:
+                continue
+            targets = str(row['targets']).split(',') if pd.notna(row['targets']) else []
+            indices = [gene_name_to_idx[t.upper().strip()] for t in targets
+                       if t.upper().strip() in gene_name_to_idx]
+            if indices:
+                drug_to_target_indices[drug] = indices
+        print(f"Drug-target mapping: {len(drug_to_target_indices)} drugs with targets in selected genes")
     
     # Check if using metadata (metaselection)
     use_knn_matching = experiment_type.lower() == 'metaselection'
@@ -499,25 +580,34 @@ def train(args):
         'drug_emb_dim': detected_drug_emb_dim,
     }
     
-    # Add scgpt_layers and gp_layers only for protein/ppi models
-    if model_name in ['protein', 'ppi']:
-        model_kwargs['scgpt_layers'] = 12
-        model_kwargs['gp_layers'] = 3
+    # Add scgpt_layers and gp_layers for protein/ppi/enhanced models
+    if model_name in ['protein', 'ppi', 'enhanced']:
+        model_kwargs['scgpt_layers'] = config.get('scgpt_layers', 12)
+        model_kwargs['gp_layers'] = config.get('gp_layers', 3)
         # Get ESM dimension dynamically from the embeddings matrix
         if esm_embeddings is not None:
             model_kwargs['esm_dim'] = esm_embeddings.shape[1]
         else:
             model_kwargs['esm_dim'] = 1280  # Fallback
         print(f"Using ESM dimension: {model_kwargs['esm_dim']}")
-    
-    # Remove nlayers for protein/ppi models (they use scgpt_layers instead)
-    if model_name in ['protein', 'ppi', 'scgptwithvirtualprotein', 'scgptwithvirtualproteinandppi']:
+
+    # Remove nlayers for protein/ppi/enhanced models (they use scgpt_layers instead)
+    if model_name in ['protein', 'ppi', 'enhanced', 'scgptwithvirtualprotein', 'scgptwithvirtualproteinandppi']:
         if 'nlayers' in model_kwargs:
             del model_kwargs['nlayers']
-    
+
     # Add PPI adjacency if using PPI model
     if model_name in ['ppi', 'scgptwithvirtualproteinandppi']:
         model_kwargs['ppi_adjacency'] = ppi_adjacency
+
+    # Add enhanced-specific params
+    if model_name == 'enhanced':
+        model_kwargs['ppi_adjacency'] = ppi_adjacency
+        model_kwargs['pathway_adjacency'] = pathway_adjacency
+        model_kwargs['pathway_bias_scale'] = config.get('pathway_bias_scale', 1.0)
+        model_kwargs['target_bias_value'] = config.get('target_bias_value', 3.0)
+        model_kwargs['target_propagation_decay'] = config.get('target_propagation_decay', 0.5)
+        model_kwargs['use_population_decomposition'] = config.get('use_population_decomposition', True)
     
     # Add target_bias specific params
     if experiment_type.lower() == 'target_bias':
@@ -546,7 +636,7 @@ def train(args):
         # Define prefix mapping (same as previous/3_protein/train_dp.py)
         # For protein/ppi models: transformer_encoder -> scgpt_transformer (12 layers)
         # For baseline/metaselection/target_bias: transformer_encoder -> transformer_encoder (6 layers)
-        is_protein_model = experiment_type.lower() in ['protein', 'ppi']
+        is_protein_model = experiment_type.lower() in ['protein', 'ppi', 'enhanced']
         transformer_target = "scgpt_transformer" if is_protein_model else "transformer_encoder"
         
         mapping = {
@@ -633,6 +723,9 @@ def train(args):
     
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = torch.nn.MSELoss()
+    scheduler = create_scheduler(optimizer, config)
+    if scheduler:
+        print(f"Using scheduler: {config.get('scheduler', 'none')}")
     
     # Initialize GradScaler for mixed precision training
     scaler = GradScaler()
@@ -701,13 +794,28 @@ def train(args):
                             cell_type_id,
                             metadata
                         )
+                elif experiment_type.lower() == 'enhanced':
+                    drug_names = batch['drug']
+                    # Build target_gene_mask from drug-target mapping
+                    target_gene_mask = torch.zeros(c_gene.shape[0], len(selected_genes), device=device)
+                    for i, drug in enumerate(drug_names):
+                        if drug in drug_to_target_indices:
+                            for idx in drug_to_target_indices[drug]:
+                                target_gene_mask[i, idx] = 1.0
+                    esm_batch = esm_embeddings.unsqueeze(0).expand(c_gene.shape[0], -1, -1)
+                    with autocast():
+                        pred_delta = model(
+                            gene_ids.unsqueeze(0).expand(c_gene.shape[0], -1),
+                            c_gene,
+                            drug_emb,
+                            cell_type_id,
+                            esm_batch,
+                            target_gene_mask=target_gene_mask
+                        )
                 elif experiment_type.lower() in ['protein', 'ppi']:
-                    # Load ESM embeddings from file (same as used in previous code)
                     if 'esm_embeddings' in locals():
-                        # ESM embeddings already loaded outside the loop
                         esm_batch = esm_embeddings.unsqueeze(0).expand(c_gene.shape[0], -1, -1)
                     else:
-                        # Fallback: generate random embeddings (should not happen with proper config)
                         print("Warning: ESM embeddings not loaded, using random embeddings")
                         esm_batch = torch.randn(c_gene.shape[0], len(selected_genes), 1280).to(device)
                     with autocast():
@@ -731,7 +839,15 @@ def train(args):
             # Calculate loss with AMP
             with autocast():
                 true_delta = p_gene - c_gene
-                loss = criterion(pred_delta, true_delta)
+                if experiment_type.lower() == 'enhanced' and config.get('loss_type') == 'enhanced':
+                    loss, loss_components = compute_enhanced_loss(
+                        pred_delta, true_delta,
+                        mse_weight=config.get('mse_weight', 1.0),
+                        pearson_weight=config.get('pearson_weight', 0.5),
+                        direction_weight=config.get('direction_weight', 0.1)
+                    )
+                else:
+                    loss = criterion(pred_delta, true_delta)
             
             # Backward pass with AMP
             optimizer.zero_grad()
@@ -747,6 +863,12 @@ def train(args):
         avg_loss = total_loss / len(train_loader)
         print(f"Epoch {epoch+1}/{epochs} - Average Loss: {avg_loss:.6f}")
         
+        # Step scheduler
+        if scheduler:
+            scheduler.step()
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"  Learning rate: {current_lr:.6f}")
+
         # Record epoch-loss
         epoch_losses.append({'epoch': epoch + 1, 'loss': avg_loss})
         
