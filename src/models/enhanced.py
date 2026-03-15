@@ -118,12 +118,7 @@ class scGPTEnhanced(nn.Module):
 
     def create_enhanced_bias(self, n_genes, prot_indices, target_gene_mask, device):
         """
-        Enhanced attention bias matrix combining 5 sources:
-        1. Gene-Protein matching: matched gene<->protein = +pos_bias, else -neg_bias
-        2. Confidence-weighted PPI: protein<->protein = ppi_weight * pos_bias
-        3. Pathway co-membership: gene<->gene = pathway_adjacency * pathway_bias_scale
-        4. Drug-Target: drug<->target_genes = +target_bias_value
-        5. Target-PPI propagation: target's PPI neighbors get attenuated bias
+        Enhanced attention bias matrix combining 5 sources (fully vectorized).
 
         Sequence: [Drug](1) + [Genes](n_genes) + [Proteins](n_prot)
         """
@@ -134,22 +129,21 @@ class scGPTEnhanced(nn.Module):
         gene_start = 1
         prot_start = 1 + n_genes
 
-        # --- 1. Gene-Protein base bias ---
+        # --- 1. Gene-Protein base bias (vectorized) ---
         if n_prot > 0:
             bias[gene_start:prot_start, prot_start:] = self.neg_bias
             bias[prot_start:, gene_start:prot_start] = self.neg_bias
-            for i, gene_idx in enumerate(prot_indices):
-                actual_gene = gene_start + gene_idx
-                actual_prot = prot_start + i
-                bias[actual_gene, actual_prot] = self.pos_bias
-                bias[actual_prot, actual_gene] = self.pos_bias
+            # Matched gene<->protein pairs: use advanced indexing
+            prot_idx_tensor = torch.tensor(prot_indices, dtype=torch.long, device=device)
+            gene_positions = gene_start + prot_idx_tensor
+            prot_positions = prot_start + torch.arange(n_prot, device=device)
+            bias[gene_positions, prot_positions] = self.pos_bias
+            bias[prot_positions, gene_positions] = self.pos_bias
 
         # --- 2. Confidence-weighted PPI between protein nodes ---
         if self.ppi_adjacency is not None and n_prot > 0:
-            prot_idx_tensor = torch.tensor(prot_indices, dtype=torch.long, device=device)
             ppi_sub = self.ppi_adjacency[prot_idx_tensor][:, prot_idx_tensor]
-            ppi_bias = ppi_sub * self.pos_bias
-            bias[prot_start:prot_start + n_prot, prot_start:prot_start + n_prot] += ppi_bias
+            bias[prot_start:prot_start + n_prot, prot_start:prot_start + n_prot] += ppi_sub * self.pos_bias
 
         # --- 3. Pathway co-membership bias between genes ---
         if self.pathway_adjacency is not None:
@@ -157,30 +151,31 @@ class scGPTEnhanced(nn.Module):
                 self.pathway_adjacency * self.pathway_bias_scale
             )
 
-        # --- 4 & 5. Drug-Target bias + Target-PPI propagation ---
+        # --- 4 & 5. Drug-Target bias + Target-PPI propagation (vectorized) ---
         if target_gene_mask is not None:
-            # target_gene_mask: (batch_size, n_genes) bool or (n_genes,) bool
-            if target_gene_mask.dim() == 2:
-                t_mask = target_gene_mask.any(dim=0)  # union across batch
-            else:
-                t_mask = target_gene_mask
-
+            t_mask = target_gene_mask.any(dim=0) if target_gene_mask.dim() == 2 else target_gene_mask
             target_indices = torch.where(t_mask)[0]
-            for t_idx in target_indices:
-                t_pos = gene_start + t_idx.item()
-                # Drug <-> Target gene: positive bias
-                bias[0, t_pos] += self.target_bias_value
-                bias[t_pos, 0] += self.target_bias_value
 
-                # Target-PPI propagation: target's gene-level PPI neighbors
+            if len(target_indices) > 0:
+                target_positions = gene_start + target_indices
+                # Drug <-> Target genes: positive bias
+                bias[0, target_positions] += self.target_bias_value
+                bias[target_positions, 0] += self.target_bias_value
+
+                # Target-PPI propagation: vectorized over all targets at once
                 if self.ppi_adjacency is not None:
-                    neighbor_weights = self.ppi_adjacency[t_idx.item()]
-                    neighbor_indices = torch.where(neighbor_weights > 0)[0]
-                    for nb_idx in neighbor_indices:
-                        nb_pos = gene_start + nb_idx.item()
-                        attn_val = self.target_bias_value * self.target_propagation_decay * neighbor_weights[nb_idx].item()
-                        bias[0, nb_pos] += attn_val
-                        bias[nb_pos, 0] += attn_val
+                    # Sum PPI weights from all target genes to all other genes
+                    # shape: (n_targets, n_genes) -> max over targets -> (n_genes,)
+                    target_ppi_weights = self.ppi_adjacency[target_indices]  # (n_targets, n_genes)
+                    propagated = target_ppi_weights.max(dim=0).values  # (n_genes,)
+                    propagated = propagated * (self.target_bias_value * self.target_propagation_decay)
+                    # Zero out target genes themselves to avoid double-counting
+                    propagated[target_indices] = 0.0
+                    neighbor_mask = propagated > 0
+                    neighbor_positions = gene_start + torch.where(neighbor_mask)[0]
+                    neighbor_values = propagated[neighbor_mask]
+                    bias[0, neighbor_positions] += neighbor_values
+                    bias[neighbor_positions, 0] += neighbor_values
 
         return bias
 

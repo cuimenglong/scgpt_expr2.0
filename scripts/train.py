@@ -482,12 +482,23 @@ def train(args):
         if len(valid_genes) < len(selected_genes):
             print(f"Warning: {len(selected_genes) - len(valid_genes)} genes not found in vocabulary, skipping")
         
-        gene_ids_for_esm = torch.tensor(
-            [vocab_dict[g] for g in valid_genes],
-            dtype=torch.long
-        )
-        esm_embeddings = esm_matrix[gene_ids_for_esm].to(device)
-        print(f"ESM embeddings prepared: shape {esm_embeddings.shape}")
+        if experiment_type.lower() == 'enhanced':
+            # Enhanced model needs full-size ESM (n_genes, esm_dim) aligned with gene_ids
+            esm_embeddings = torch.zeros(len(selected_genes), esm_dim, device=device)
+            for i, g in enumerate(selected_genes):
+                if g in vocab_dict:
+                    vocab_idx = vocab_dict[g]
+                    if vocab_idx < esm_matrix.shape[0]:
+                        esm_embeddings[i] = esm_matrix[vocab_idx].to(device)
+            print(f"ESM embeddings (full-size) prepared: shape {esm_embeddings.shape}, "
+                  f"{len(valid_genes)} genes with embeddings")
+        else:
+            gene_ids_for_esm = torch.tensor(
+                [vocab_dict[g] for g in valid_genes],
+                dtype=torch.long
+            )
+            esm_embeddings = esm_matrix[gene_ids_for_esm].to(device)
+            print(f"ESM embeddings prepared: shape {esm_embeddings.shape}")
     
     # Prepare drug targets for target_bias experiment
     drug_to_target_gene_ids = {}
@@ -514,8 +525,9 @@ def train(args):
                 drug_to_target_indices[drug] = indices
         print(f"Drug-target mapping: {len(drug_to_target_indices)} drugs with targets in selected genes")
     
-    # Check if using metadata (metaselection)
-    use_knn_matching = experiment_type.lower() == 'metaselection'
+    # Check if using KNN metadata matching (metaselection or enhanced with config flag)
+    use_knn_matching = (experiment_type.lower() == 'metaselection' or
+                        config.get('use_knn_matching', False))
     
     # Create dataset with appropriate settings
     # Enable ChemBERTa drug embeddings by default
